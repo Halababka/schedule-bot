@@ -1,0 +1,142 @@
+addEvent(event: Event): void - Добавляет новое событие в расписание.
+removeEvent(eventId: Int): void - Удаляет событие из расписания по его идентификатору.
+updateEvent(eventId: Int, newEventData: Event): void - Обновляет данные события в расписании.
+getEvent(eventId: Int): Event | null - Получает событие по его идентификатору.
+getAllEvents(): Event[] - Получает список всех событий в расписании.
+hasChanged(): boolean - Проверяет, изменилось ли расписание с последнего сохранения.
+getChecksum(): string - Получает контрольную сумму расписания для проверки изменений.
+loadFromUrl(url: string): Promise<void> - Загружает расписание из указанного URL.
+save(): Promise<void> - Сохраняет текущее состояние расписания в базе данных.
+notifySubscribers(): void - Уведомляет подписчиков о изменениях в расписании.
+printSchedule(): void - Выводит расписание в удобочитаемом формате (например, в консоль или файл).
+
+{
+  'Техникум': {
+    '1 отделение': {
+      'АЭС-21-Т': 'https://edu.viti-mephi.ru/rasp/raspth.php?group=АЭС-21-Т, АЭСс-22-Т',
+      'АЭСс-22-Т': 'https://edu.viti-mephi.ru/rasp/raspth.php?group=АЭС-21-Т, АЭСс-22-Т',
+      'АЭС-22-Т': 'https://edu.viti-mephi.ru/rasp/raspth.php?group=АЭС-22-Т, АЭСс-23-Т'
+    },
+    '2 отделение': {
+      'ИС-21-Т1': 'https://edu.viti-mephi.ru/rasp/raspth.php?group=ИС-21-Т1, ИСс-22-Т1',
+      'ИСс-22-Т1': 'https://edu.viti-mephi.ru/rasp/raspth.php?group=ИС-21-Т1, ИСс-22-Т1',
+      'ИС-21-Т2': 'https://edu.viti-mephi.ru/rasp/raspth.php?group=ИС-21-Т2, ИСс-22-Т2'
+    }
+  },
+  'Институт': {
+    'Общее': {
+      'ВО_Расписание пересдач_за летнюю сессию23-24': 'https://edu.viti-mephi.ru/file/rasp/1725886418-vo_raspisanie_peresdach_za_letnyuyu_sessiyu23-24.xlsx',
+      'Расписание диагностического тестирования': 'https://edu.viti-mephi.ru/file/rasp/1726056847-raspisanie_diagnosticheskogo_testirovaniya.xlsx'
+    },
+    '1 курс': {
+      'АЭС-24-Д1': 'https://edu.viti-mephi.ru/rasp/raspin.php?group=АЭС-24-Д1',
+      'АЭС-24-Д2': 'https://edu.viti-mephi.ru/rasp/raspin.php?group=АЭС-24-Д2'
+    },
+    '2 курс': {
+      'АЭС-23-Д1': 'https://edu.viti-mephi.ru/rasp/raspin.php?group=АЭС-23-Д1',
+      'АЭС-23-Д2': 'https://edu.viti-mephi.ru/rasp/raspin.php?group=АЭС-23-Д2'
+    }
+  }
+}
+
+// bot.on(callbackQuery("data"), async (ctx) => {
+//   const path = JSON.parse(ctx.callbackQuery.data);
+//   const level = groupsObject.getLevel(path);
+//   console.log(ctx.callbackQuery.data)
+//   // Если level является объектом, показываем следующую клавиатуру
+//   if (typeof level === 'object' && Object.keys(level).length) {
+//     const keyboard = groupsObject.generateKeyboard(path);
+//     ctx.editMessageText('Выберите расписание:', {
+//       reply_markup: {
+//         inline_keyboard: keyboard // Передаём клавиатуру в формате массивов строк
+//       }
+//     });
+//   }
+//   // Если level является строкой, значит это URL, и можно получить расписание
+//   else if (typeof level === 'string') {
+//     const url = level;
+//     console.log("OK")
+//     const schedule = new Schedule(url);
+//     const scheduleData = await schedule.fetchSchedule();
+//
+//     if (scheduleData) {
+//       const message = formatSchedule(scheduleData);
+//       const parts = splitMessage(message);
+//       for (const part of parts) {
+//         ctx.reply(part); // или отформатируйте данные по своему усмотрению
+//       }
+//     } else {
+//       ctx.reply('Не удалось получить расписание.');
+//     }
+//   } else {
+//     ctx.reply('Ошибка: группа не найдена.');
+//   }
+// });
+
+bot.on(callbackQuery("data"), async (ctx) => {
+    console.log(ctx.callbackQuery.data)
+
+    if (ctx.callbackQuery.data === "show_all_days") {
+        if (schedule) {
+            const allDaysSchedule = schedule.getAllDaysSchedule();
+            const message = formatSchedule(allDaysSchedule); // Форматируем все дни
+            const parts = splitMessage(message);
+            for (const part of parts) {
+                await ctx.reply(part);
+            }
+            return
+        } else {
+            ctx.reply('Расписание не загружено.');
+        }
+    }
+    if (ctx.callbackQuery.data.startsWith("show_day_")) {
+        const day = ctx.callbackQuery.data.replace('show_day_', '');
+        if (schedule) {
+            const daySchedule = schedule.getScheduleForDay(day);
+            if (daySchedule) {
+                const message = formatSchedule([daySchedule]); // Форматируем только выбранный день
+                const parts = splitMessage(message);
+                for (const  part of parts) {
+                    await ctx.reply(part);
+                }
+                return
+            } else {
+                ctx.reply('Не удалось найти расписание для выбранного дня.');
+            }
+        } else {
+            ctx.reply('Расписание не загружено.');
+        }
+    }
+    const path = JSON.parse(ctx.callbackQuery.data);
+    const level = groupsObject.getLevel(path);
+
+    if (typeof level === 'object' && Object.keys(level).length) {
+        const keyboard = groupsObject.generateKeyboard(path);
+        ctx.editMessageText('Выберите расписание:', {
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
+        });
+    } else if (typeof level === 'string') {
+        const url = level;
+        console.log("Fetching schedule...");
+        schedule = new Schedule(url);
+        const scheduleData = await schedule.fetchSchedule();
+
+        if (scheduleData) {
+            const daysKeyboard = scheduleData.map(day => [Markup.button.callback(day.day, `show_day_${day.day}`)]).concat([[Markup.button.callback('Все дни', 'show_all_days')]]);
+            ctx.reply('Выберите день для показа:', Markup.inlineKeyboard(daysKeyboard));
+        } else {
+            ctx.reply('Не удалось получить расписание.');
+        }
+    } else {
+        ctx.reply('Ошибка: группа не найдена.');
+    }
+});
+
+        } else if (action.startsWith("t_")) {
+            await title(ctx);
+        } else if (/^s_(.+)_(.+)$/.test(action)) {
+            await section(ctx);
+        } else if (/^g_(.+)_(.+)_(.+)$/.test(action)) {
+            await group(ctx);
