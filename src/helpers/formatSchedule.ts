@@ -3,7 +3,7 @@ export function formatSchedule(scheduleData: any) {
 
   scheduleData.forEach((day: any) => {
     result += `📅 ${day.day}:\n`;
-    result += `________________________\n\n`;
+    result += `_____________________________\n\n`;
 
     day.lessons.forEach((lesson: any) => {
       result += `🕒 Время: ${lesson.time}\n`;
