@@ -1,7 +1,9 @@
 import * as cheerio from 'cheerio';
 import axios from 'axios';
 import https from 'https';
-import crypto from 'crypto';
+import {scheduleService} from "../src/services/schedule.service";
+import logger from "../src/utils/logger";
+import {ScheduleCache} from "./ScheduleCash";
 
 interface Lesson {
   time: string;
@@ -16,6 +18,8 @@ export interface DaySchedule {
   lessons: Lesson[];
 }
 
+const scheduleCache = new ScheduleCache();
+
 export class Schedule {
   private previousChecksum?: string;
   schedule: DaySchedule[]
@@ -24,7 +28,68 @@ export class Schedule {
     this.schedule = schedule
   }
 
-  // Новый метод для парсинга данных из HTML
+  // Метод для получения расписания и его парсинга
+  async fetchSchedule(url: string, retries: number = 2, skipDbData: boolean = false): Promise<DaySchedule[] | null> {
+    const agent = new https.Agent({
+      rejectUnauthorized: false
+    });
+
+    // Попытка загрузить данные из кэша
+    const cachedSchedule = scheduleCache.get(url);
+    if (cachedSchedule) {
+      logger.debug('Returning schedule from cache.');
+      this.schedule = cachedSchedule;
+      return this.schedule;
+    }
+
+    // Попытки загрузки по URL
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        const { data } = await axios.get(url, { httpsAgent: agent });
+
+        // Парсим и сохраняем загруженное расписание
+        this.schedule = this.parseSchedule(data);
+
+        // Сохраняем в кэш
+        scheduleCache.set(url, this.schedule);
+
+        return this.schedule;
+      } catch (error) {
+        logger.error(`Error fetching schedule by URL (attempt ${attempt + 1}):`, error);
+
+        if (attempt === retries - 1) {
+          logger.warn('All attempts to fetch schedule by URL failed.');
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+    }
+
+    // Если данные из URL не получены, попробуем запросить их из базы данных
+    if (!skipDbData) {
+      try {
+        logger.debug('Fetching schedule from database...');
+        const data = await scheduleService.getSchedulesFilterUrl(url) || { schedule: "", lastUpdate: null };
+
+        const scheduleFromDb: DaySchedule[] = JSON.parse(data.schedule || '[]');
+        const lastUpdate = data.lastUpdate ? new Date(data.lastUpdate) : null;
+        const now = new Date();
+
+        // Проверяем, есть ли расписание в базе и прошло ли более 30 минут с последнего обновления
+        if (scheduleFromDb.length > 0 && lastUpdate && ((now.getTime() - lastUpdate.getTime()) / (1000 * 60) < 30)) {
+          logger.debug('Returning cached schedule from database.');
+
+          this.schedule = scheduleFromDb;
+          return this.schedule;
+        }
+      } catch (error) {
+        logger.error(`Error fetching schedule from database: ${error}`);
+      }
+    }
+
+    return null; // Если ничего не удалось, возвращаем null
+  }
+
   private parseSchedule(data: string): DaySchedule[] {
     const $ = cheerio.load(data);
     const schedule: DaySchedule[] = [];
@@ -87,28 +152,8 @@ export class Schedule {
     return schedule;
   }
 
-  // Метод для получения расписания и его парсинга
-  async fetchSchedule(url: string): Promise<DaySchedule[] | null> {
-    try {
-      const agent = new https.Agent({
-        rejectUnauthorized: false
-      });
-
-      const { data } = await axios.get(url, { httpsAgent: agent });
-
-      // Используем новый метод для парсинга данных
-      this.schedule = this.parseSchedule(data);
-
-      return this.schedule;
-    } catch (error) {
-      console.error('Error fetching schedule:', error);
-      return null;
-    }
-  }
-
   // Метод для получения расписания на конкретный день
   public getScheduleForDay(day: string): DaySchedule | null {
-    console.log(this.schedule)
     const daySchedule = this.schedule.find(d => d.day.includes(day));
     return daySchedule || null; // Возвращает расписание на день или null, если день не найден
   }
