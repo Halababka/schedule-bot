@@ -1,100 +1,67 @@
 import "dotenv/config"
-import {session, Telegraf, Markup} from "telegraf";
+import {session, Telegraf, Markup, TelegramError} from "telegraf";
 import {Schedule} from "../classes/Schedule";
-import {splitMessage} from "./helpers/splitMessage";
 import {GroupsObject} from "../classes/GroupsObject";
-import {formatSchedule} from "./helpers/formatSchedule";
 import {MyContext, SessionData} from "./models/Telegraf-bot";
-import {initHelpCommand} from "./commands/help";
-import {initScheduleCommand} from "./commands/schedule";
 import {createMenuWithBackButton, getMainMenu} from "./helpers/keyboard";
 import {COMMANDS} from "./commands/listCommands";
-import {formatDate} from "./helpers/formatDate";
 import {SQLite} from "@telegraf/session/sqlite";
 import {SessionStore} from "telegraf";
-import {prisma} from "../prisma/prisma";
+import {userService} from "./services/user.service";
+import {scheduleService} from "./services/schedule.service";
+import {handleScheduleMessage} from "./helpers/handleScheduleMessage";
+import telegrafThrottler from "telegraf-throttler";
+import {formatSchedule} from "./helpers/formatSchedule";
+import {splitMessage} from "./helpers/splitMessage";
+import {InlineQueryResultArticle} from "@telegraf/types/inline";
+import {sessionInit} from "./middlewares/sessionInit";
+import {resetSession} from "./helpers/resetSession";
+import {initCommands} from "./commands";
+import logger, {dataBaseLogger} from './utils/logger';
+import {historyVisit} from "./middlewares/historyVisit";
+import {checkForScheduleUpdatesWithSubscribers} from "./helpers/checkForScheduleUpdatesWithSubscribers";
+import delay from "./utils/delay";
 
-const urlRSS = 'https://viti-mephi.ru/taxonomy/term/177/feed';
+const urlRSS = process.env.RSS_URL || 'https://viti-mephi.ru/taxonomy/term/177/feed';
 const token = process.env.BOT_TOKEN
-const groupsObject: GroupsObject = new GroupsObject();
+const sessionDbUrl: string = process.env.DB_SESSION_URL || ""
+const groupsObject: GroupsObject = new GroupsObject(urlRSS);
 const TITLE_PREFIX = 't_';
 const SECTION_PREFIX = 's_';
 const GROUP_PREFIX = 'g_';
-let currGroupMatch: { action: string, match: [] }
+const TITLE_SELECT_PREFIX = "ts_"
+const SECTION_SELECT_PREFIX = "ss_"
+const GROUP_SELECT_PREFIX = "gs_"
+const throttler = telegrafThrottler();
 
 if (token === undefined) {
     throw new TypeError("BOT_TOKEN must be provided!");
 }
 
 const store: SessionStore<SessionData> = SQLite({
-    filename: "E:\\TgBot\\database\\telegraf-sessions.sqlite",
+    filename: sessionDbUrl,
+    config: {
+        verbose: (message?) => {
+            dataBaseLogger.log("database", message)
+        }
+    }
 });
 
 export const bot = new Telegraf<MyContext>(token);
+logger.info("Бот запущен")
+bot.telegram.setMyCommands(COMMANDS).then(r => logger.info(`Команды установлены?: ${r}`))
+initCommands(bot)
 
-bot.telegram.setMyCommands(COMMANDS)
 bot.use(session({store}));
-initHelpCommand(bot)
-initScheduleCommand(bot)
-bot.use(async (ctx, next) => {
-    // Проверяем, инициализирована ли сессия
-    if (!ctx.session) {
-        ctx.session = {
-            pathHistory: [],  // Пример: история навигации
-            schedule: []
-        };
-    }
-
-    if (groupsObject.daysDifferent()) {
-        await groupsObject.initializeGroupsObject(urlRSS);
-    }
-
-    logger("Использует бота", ctx)
-    // console.log("session", ctx.session)
-    // Переходим к следующему middleware или обработчику
-    return next();
-});
+bot.use(throttler);
+bot.use(sessionInit())
+bot.use(historyVisit)
 
 bot.start(async (ctx) => {
-    logger("Start", ctx)
+    await resetSession(ctx)
 
-    // сброс сессии
-    ctx.session.pathHistory ??= []
-    ctx.session.schedule ??= []
-
-    if (groupsObject.lastUpdateTime) {
-        const humanReadableDate = formatDate(groupsObject.lastUpdateTime)
-        await ctx.reply(`Привет, я Schedule!\n\nРасписание обновлено: ${humanReadableDate}\n\n`);
-    } else {
-        await ctx.reply(`Привет, я Schedule!`)
-    }
-
-    await ctx.reply('Главное меню:', getMainMenu());
-});
-
-bot.action('back', async (ctx) => {
-    const previousState = ctx.session.pathHistory.pop();
-
-    if (previousState) {
-        const {action, match} = previousState;
-        ctx.match = match;
-
-        if (action === 'main_menu') {
-            await mainMenu(ctx);
-        } else if (action === 'schedule_choice') {
-            await scheduleChoice(ctx);
-        } else if (action.startsWith(TITLE_PREFIX)) {
-            await title(ctx);
-        } else if (action.startsWith(SECTION_PREFIX)) {
-            await section(ctx);
-        } else if (action.startsWith(GROUP_PREFIX)) {
-            await group(ctx);
-        } else {
-            await ctx.reply('Вы находитесь в главном меню.');
-        }
-    } else {
-        await ctx.reply('Вы находитесь в главном меню.');
-    }
+    await ctx.reply(`Привет, я Schedule!`)
+    await ctx.reply('Главное меню:', getMainMenu(ctx));
 });
 
 bot.action('main_menu', async (ctx) => {
@@ -107,8 +74,40 @@ async function mainMenu(ctx: MyContext) {
     ctx.session.pathHistory ??= [];
 
     await ctx.editMessageText('Главное меню:', {
-        reply_markup: getMainMenu().reply_markup
+        reply_markup: getMainMenu(ctx).reply_markup
     });
+}
+
+bot.action('schedule_monitored', async (ctx) => {
+    ctx.session.pathHistory.push({
+        action: 'main_menu',
+        match: ctx.match // Сохраняем match
+    })
+
+    await scheduleMonitored(ctx)
+});
+
+async function scheduleMonitored(ctx: MyContext) {
+    let scheduleData
+
+    if (ctx.session.userData && ctx.session.userData.Schedule) {
+        const schedule = new Schedule()
+        scheduleData = await schedule.fetchSchedule(ctx.session.userData.Schedule.url)
+    } else {
+        scheduleData = await userService.getScheduleUser(ctx.from.id)
+    }
+
+    if (scheduleData) {
+        const days = scheduleData.map(item => item.day);
+        const dayKeyboard = groupsObject.generateDaysKeyboard(days, 'scheduleMonitored');
+        await ctx.editMessageText('Выберите день для показа:', {
+            reply_markup: createMenuWithBackButton(dayKeyboard, ctx).reply_markup
+        });
+    } else {
+        await ctx.editMessageText('Нету отслеживаемой группы', {
+            reply_markup: createMenuWithBackButton([], ctx).reply_markup
+        });
+    }
 }
 
 bot.action("schedule_choice", async (ctx) => {
@@ -138,16 +137,17 @@ bot.action(/^t_(.+)$/, async (ctx) => {
         action: 'schedule_choice',
         match: ctx.match // Сохраняем match
     });
-    await title(ctx)
+
+    await title(ctx, SECTION_PREFIX)
 });
 
-async function title(ctx: MyContext) {
+async function title(ctx: MyContext, prefix: string) {
     const title = ctx.match[1];
     const sections = groupsObject.getSection(title);
 
     if (sections) {
         const sectionButtons = sections.map(section =>
-            Markup.button.callback(section, `${SECTION_PREFIX}${title}_${section}`)
+            Markup.button.callback(section, `${prefix}${title}_${section}`)
         );
 
         const keyboard = createMenuWithBackButton(sectionButtons, ctx);
@@ -166,10 +166,10 @@ bot.action(/^s_(.+)_(.+)$/, async (ctx) => {
         action: `t_${ctx.match[1]}`,
         match: ctx.match // Сохраняем match для возврата
     });
-    await section(ctx)
+    await section(ctx, GROUP_PREFIX)
 });
 
-async function section(ctx: MyContext) {
+async function section(ctx: MyContext, prefix: string) {
     const [title] = ctx.match[1].split('_');
     const [section] = ctx.match[2].split('_');
 
@@ -177,7 +177,7 @@ async function section(ctx: MyContext) {
 
     if (groups) {
         const groupButtons = Object.keys(groups).map(group =>
-            Markup.button.callback(group, `${GROUP_PREFIX}${title}_${section}_${group}`)
+            Markup.button.callback(group, `${prefix}${title}_${section}_${group}`)
         );
         const keyboard = createMenuWithBackButton(groupButtons, ctx);
 
@@ -185,17 +185,19 @@ async function section(ctx: MyContext) {
             reply_markup: keyboard.reply_markup
         });
     } else {
-        await ctx.reply('Группы не найдены.');
+        await ctx.editMessageText('Группы не найдены', {
+            reply_markup: createMenuWithBackButton([], ctx).reply_markup
+        });
     }
 }
 
 // Обработка групп
 bot.action(/^g_(.+)_(.+)_(.+)$/, async (ctx) => {
-    currGroupMatch = {
+    ctx.session.currGroupMatch = {
         action: ctx.match[0],
         match: ctx.match
     }
-    const modifiedString = ctx.match[0].replace(/^g_/, '');
+    const modifiedString = `${ctx.match[1]}_${ctx.match[2]}`
 
     ctx.session.pathHistory.push({
         action: `s_${modifiedString}`,
@@ -205,7 +207,9 @@ bot.action(/^g_(.+)_(.+)_(.+)$/, async (ctx) => {
 });
 
 async function group(ctx: MyContext) {
-    const [prefix, title, section, group] = ctx.match[0].split('_');
+    const title = ctx.match[1]
+    const section = ctx.match[2]
+    const group = ctx.match[3]
     const link = groupsObject.getGroupLink(title, section, group);
     if (link) {
         const schedule = new Schedule();
@@ -213,113 +217,271 @@ async function group(ctx: MyContext) {
         if (scheduleData) {
             ctx.session.schedule = scheduleData;
             const days = scheduleData.map(item => item.day);
-            const dayKeyboard = groupsObject.generateDaysKeyboard(days);
+            const dayKeyboard = groupsObject.generateDaysKeyboard(days, 'group');
             await ctx.editMessageText('Выберите день для показа:', {
                 reply_markup: createMenuWithBackButton(dayKeyboard, ctx).reply_markup
             });
         } else {
-            ctx.reply('Не удалось получить расписание.');
+            await ctx.editMessageText('Не удалось получить расписание', {
+                reply_markup: createMenuWithBackButton([], ctx).reply_markup
+            });
         }
     } else {
-        await ctx.reply('Ссылка не найдена.');
+        await ctx.editMessageText('Ссылка не найдена', {
+            reply_markup: createMenuWithBackButton([], ctx).reply_markup
+        });
     }
 }
 
-bot.action(/day_(.+)/, async (ctx) => {
-    const previousGroupAction = currGroupMatch;
+bot.action(/(group|scheduleMonitored)_day_(.+)/, async (ctx) => {
+    const source = ctx.match[1];
 
-    if (previousGroupAction) {
-        // Сохраняем полную информацию о группе для возврата
+    if (source === 'scheduleMonitored') {
         ctx.session.pathHistory.push({
-            action: previousGroupAction.action, // Сохраняем действие группы
-            match: previousGroupAction.match // Сохраняем текущий день
+            action: 'schedule_monitored',
+            match: ctx.match // Сохраняем match
         });
+    } else {
+        const previousGroupAction = ctx.session.currGroupMatch;
+
+        if (previousGroupAction) {
+            // Сохраняем полную информацию о группе для возврата
+            ctx.session.pathHistory.push({
+                action: previousGroupAction.action, // Сохраняем действие группы
+                match: previousGroupAction.match // Сохраняем текущий день
+            });
+        }
     }
 
     await day(ctx)
 })
 
 async function day(ctx: MyContext) {
-    const day = ctx.match[1];
-    const schedule = new Schedule(ctx.session.schedule)
+    const [source, , day] = ctx.match[0].split('_');
+    // const day = ctx.match[1];
+
+    const useScheduleMonitored = source === 'scheduleMonitored';
+
+    let schedule
+
+    if (useScheduleMonitored) {
+        const scheduleData = await userService.getScheduleUser(ctx.from.id)
+        schedule = new Schedule(scheduleData)
+    } else {
+        schedule = new Schedule(ctx.session.schedule);
+    }
     if (schedule) {
         const daySchedule = schedule.getScheduleForDay(day);
         if (daySchedule) {
-            const message = formatSchedule([daySchedule]); // Форматируем только выбранный день
-            const parts = splitMessage(message);
-            if (parts.length === 1) {
-                await ctx.editMessageText(`${parts[0]}`, {
-                    reply_markup: createMenuWithBackButton([], ctx).reply_markup
-                });
-            } else {
-                for (let part = 0; part < parts.length; part++) {
-                    if (part === 0) {
-                        await ctx.editMessageText(`${parts[part]}`, {
-                            reply_markup: createMenuWithBackButton([], ctx).reply_markup
-                        });
-                    }
-                    if (part === parts.length - 1) {
-                        await ctx.reply(`${parts[part]}`, {
-                            reply_markup: createMenuWithBackButton([], ctx).reply_markup
-                        });
-                    } else {
-                        await ctx.reply(parts[part]);
-                    }
-                }
-            }
-            return
+            await handleScheduleMessage(ctx, [daySchedule]);
         } else {
-            ctx.reply('Не удалось найти расписание для выбранного дня.');
+            await ctx.editMessageText('Не удалось найти расписание для выбранного дня', {
+                reply_markup: createMenuWithBackButton([], ctx).reply_markup
+            });
         }
     } else {
-        ctx.reply('Расписание не загружено.');
+        await ctx.editMessageText('Расписание не загружено', {
+            reply_markup: createMenuWithBackButton([], ctx).reply_markup
+        });
     }
 }
 
-bot.action('all_days', async (ctx) => {
-    // @ts-ignore
-    const previousGroupAction = currGroupMatch;
+bot.action(/(group|scheduleMonitored)_all_days/, async (ctx) => {
+    const [source] = ctx.match[0].split('_');
 
-    if (previousGroupAction) {
-        // Сохраняем полную информацию о группе для возврата
+    const previousGroupAction = ctx.session.currGroupMatch;
+
+    if (source === 'scheduleMonitored') {
         ctx.session.pathHistory.push({
-            action: previousGroupAction.action, // Сохраняем действие группы
-            match: previousGroupAction.match
+            action: 'schedule_monitored',
+            match: ctx.match // Сохраняем match
         });
+    } else {
+        if (previousGroupAction) {
+            // Сохраняем полную информацию о группе для возврата
+            ctx.session.pathHistory.push({
+                action: previousGroupAction.action, // Сохраняем действие группы
+                match: previousGroupAction.match
+            });
+        }
     }
 
-    await allDays(ctx)
+    await allDays(ctx, source)
 });
 
-async function allDays(ctx: MyContext) {
-    const schedule = new Schedule(ctx.session.schedule)
+async function allDays(ctx: MyContext, source: string) {
+    // Проверяем источник действия
+    const useScheduleMonitored = source === 'scheduleMonitored';
+
+    let schedule
+
+    if (useScheduleMonitored) {
+        const scheduleData = await userService.getScheduleUser(ctx.from.id)
+        schedule = new Schedule(scheduleData)
+    } else {
+        schedule = new Schedule(ctx.session.schedule);
+    }
 
     if (schedule) {
         const allDaysSchedule = schedule.getAllDaysSchedule();
-        const message = formatSchedule(allDaysSchedule); // Форматируем все дни
-        const parts = splitMessage(message);
-        if (parts.length === 1) {
-            await ctx.editMessageText(`${parts[0]}`, {
+        await handleScheduleMessage(ctx, allDaysSchedule, []);
+    } else {
+        await ctx.editMessageText('Расписание не загружено', {
+            reply_markup: createMenuWithBackButton([], ctx).reply_markup
+        });
+    }
+}
+
+bot.on('inline_query', async (ctx) => {
+    const query = ctx.inlineQuery.query.trim();
+
+    // Проверяем длину запроса
+    if (query.length < 2 || query.length > 15) {
+        return;
+    }
+
+    // Получаем все группы, которые соответствуют запросу
+    const matchedGroups = groupsObject.getAllGroups(query);
+
+    // Формируем результаты для отображения в инлайн-режиме
+    const results: InlineQueryResultArticle[] = matchedGroups.map((group, index) => ({
+        type: 'article',
+        id: String(index),
+        title: group.name,
+        input_message_content: {
+            message_text: `Вы выбрали группу: ${group.name}`
+        },
+        description: `Расписание для группы ${group.name}`,
+        reply_markup: {
+            inline_keyboard: [[
+                {text: `Посмотреть расписание`, callback_data: `${GROUP_PREFIX}${group.name}`}
+            ]]
+        }
+    }));
+
+    // Отправляем ответ на inline-запрос
+    await ctx.answerInlineQuery(results);
+});
+bot.action(/^g_(.+)$/, async (ctx) => {
+    const group = ctx.match[1]
+    const link = groupsObject.getLinkGroup(group)
+
+    if (link) {
+        const schedule = new Schedule();
+        const scheduleData = await schedule.fetchSchedule(link);
+
+        if (scheduleData) {
+            const allDaysSchedule = schedule.getAllDaysSchedule();
+            const message = formatSchedule(allDaysSchedule); // Форматируем расписание
+            const parts = splitMessage(message); // Разбиваем сообщение на части
+            if (parts.length === 1) {
+                await ctx.editMessageText(`${parts[0]}`);
+            } else {
+                for (let part = 0; part < parts.length; part++) {
+                    if (part === 0) {
+                        await ctx.editMessageText(`${parts[part]}`);
+                    }
+                    if (part === parts.length - 1) {
+                        await ctx.reply(`${parts[part]}`);
+                    } else {
+                        await ctx.reply(`${parts[part]}`);
+                    }
+                }
+            }
+        } else {
+            ctx.editMessageText('Не удалось получить расписание');
+        }
+    } else {
+        logger.error(`Cсылка для парсинга расписания не была найдена ${group}`)
+        await ctx.editMessageText('Расписание не найдено');
+    }
+});
+bot.action('choice_group', async (ctx) => {
+
+    ctx.session.pathHistory.push({
+        action: 'profile',
+        match: ctx.match // Сохраняем match
+    });
+
+    await choiceGroup(ctx)
+});
+
+async function choiceGroup(ctx: MyContext) {
+    try {
+        // Инициализируем процесс выбора группы через groupsObject
+        const titles = groupsObject.getTitle();
+        const titleButtons = titles.map(title => Markup.button.callback(title, `ts_${title}`));
+        const inlineKeyboard = createMenuWithBackButton(titleButtons, ctx);
+
+        await ctx.editMessageText('Выберите факультет или категорию:', {
+            reply_markup: inlineKeyboard.reply_markup
+        });
+    } catch (error) {
+        console.error('Ошибка при выборе группы:', error);
+        await ctx.editMessageText('Произошла ошибка при получении списка групп', {
+            reply_markup: createMenuWithBackButton([], ctx).reply_markup
+        });
+    }
+}
+
+// Логика для обработки заголовков
+bot.action(/^ts_(.+)$/, async (ctx) => {
+    ctx.session.pathHistory.push({
+        action: 'choice_group',
+        match: ctx.match // Сохраняем match
+    });
+
+    await title(ctx, SECTION_SELECT_PREFIX)
+});
+
+// Логика для обработки разделов
+bot.action(/^ss_(.+)_(.+)$/, async (ctx) => {
+    ctx.session.pathHistory.push({
+        action: `ts_${ctx.match[1]}`,
+        match: ctx.match // Сохраняем match для возврата
+    });
+
+    await section(ctx, GROUP_SELECT_PREFIX)
+});
+
+// Логика для обработки групп
+bot.action(/^gs_(.+)_(.+)_(.+)$/, async (ctx) => {
+    const modifiedString = `${ctx.match[1]}_${ctx.match[2]}`
+    ctx.session.pathHistory.push({
+        action: `ss_${modifiedString}`,
+        match: ctx.match
+    })
+
+    await groupSelect(ctx)
+});
+
+async function groupSelect(ctx: MyContext) {
+    const groupName = ctx.match[3]; // Название группы
+
+    try {
+        // Получаем id группы из базы данных
+        const schedule = await scheduleService.getScheduleByName(groupName);
+
+        if (schedule) {
+            const userId = ctx.from.id;
+            // Обновляем пользователя, связывая его с выбранной группой
+            await userService.updateUserSchedule(userId, schedule.id);
+
+            ctx.session.userData = await userService.getUserByIdTg(ctx.from.id)
+
+            await ctx.editMessageText(`Группа "${groupName}" успешно выбрана для отслеживания!`, {
                 reply_markup: createMenuWithBackButton([], ctx).reply_markup
             });
         } else {
-            for (let part = 0; part < parts.length; part++) {
-                if (part === 0) {
-                    await ctx.editMessageText(`${parts[part]}`, {
-                        reply_markup: createMenuWithBackButton([], ctx).reply_markup
-                    });
-                }
-                if (part === parts.length - 1) {
-                    await ctx.reply(`${parts[part]}`, {
-                        reply_markup: createMenuWithBackButton([], ctx).reply_markup
-                    });
-                } else {
-                    await ctx.reply(parts[part]);
-                }
-            }
+            await ctx.editMessageText(`Группа "${groupName}" не найдена в базе данных`, {
+                reply_markup: createMenuWithBackButton([], ctx).reply_markup
+            });
         }
-    } else {
-        ctx.reply('Расписание не загружено.');
+    } catch (error) {
+        console.error('Ошибка при обновлении пользователя:', error);
+        await ctx.editMessageText('Не удалось выбрать группу. Попробуйте позже', {
+            reply_markup: createMenuWithBackButton([], ctx).reply_markup
+        });
     }
 }
 
@@ -329,85 +491,89 @@ bot.action('profile', async (ctx) => {
         match: []
     })
 
+    await profile(ctx)
+});
 
-    const user = await prisma.user.findUnique({
-        where: {idTg: ctx.from.id},
-        // @ts-ignore
-        include: {Schedule: true}
+async function profile(ctx: MyContext) {
+    try {
+        if (!ctx.session.userData) {
+            await userService.createUser({idTg: ctx.from.id})
+        }
+    } catch {
+    }
+
+    const user = await userService.getUserByIdTg(ctx.from.id)
+
+    ctx.session.userData = user
+
+    if (user && user.Schedule) {
+        await ctx.editMessageText(`Ваш профиль:\nГруппа, за которой вы следите: ${user.Schedule.name} (интервал 30 мин.)`, createMenuWithBackButton([
+            {
+                text: 'Сменить группу для отслеживания',
+                callback_data: 'choice_group'
+            },
+            {
+                text: 'Удалить группу',
+                callback_data: 'delete_group'
+            }
+        ], ctx));
+    } else {
+        await ctx.editMessageText('Ваш профиль:\nВы еще не выбрали группу для отслеживания', createMenuWithBackButton([{
+            text: 'Выбрать группу для отслеживания',
+            callback_data: 'choice_group'
+        }], ctx));
+    }
+}
+
+bot.action("delete_group", async (ctx) => {
+    ctx.session.pathHistory.push({
+        action: 'profile',
+        match: ctx.match // Сохраняем match
     });
+    // @ts-ignore
+    await userService.detachUserFromSchedule(ctx.session.userData.id)
 
     // @ts-ignore
-    if (user && user.schedule.length > 0) {
-        // @ts-ignore
-        const scheduleNames = user.schedule.map(s => s.name).join(', ');
-        await ctx.editMessageText(`Ваш профиль:\nГруппы, за которыми вы следите: ${scheduleNames}`, createMenuWithBackButton([], ctx));
+    await ctx.editMessageText(`Вы отменили отслеживание изменения расписания группы ${ctx.session.userData.Schedule.name}`, createMenuWithBackButton([], ctx))
+    // @ts-ignore
+    ctx.session.userData.Schedule = null;
+})
+
+// Обработчик для удаления сообщения
+bot.action('delete_message', async (ctx) => {
+    try {
+        await ctx.deleteMessage(); // Удаляет текущее сообщение
+    } catch (error) {
+        console.error('Ошибка при удалении сообщения:', error);
+    }
+});
+
+setTimeout(() => {
+    logger.info("Запущена проверка обновления расписания")
+    checkForScheduleUpdatesWithSubscribers().then(() => logger.info("Проверка обновления расписания завершена"));
+}, 5000)
+// Периодическая проверка расписаний каждые 30 минут
+setInterval(async () => {
+    await logger.info("Запущена проверка обновления расписания")
+    checkForScheduleUpdatesWithSubscribers().then(() => logger.info("Проверка обновления расписания завершена"));
+}, 30 * 1000 * 60); // 30 минут
+
+bot.catch(async (err) => {
+    logger.error(err)
+    if (err instanceof TelegramError) {
+        if (err.code === 429) {
+            // @ts-ignore
+            logger.error(`Превышено количество запросов, повтор через ${err.parameters.retry_after} секунд.`);
+            // @ts-ignore
+            await delay(err.parameters.retry_after * 1000); // Ожидание перед повторной попыткой
+        } else {
+            logger.error(`Telegram API Error: ${err.code} - ${err.description}`);
+        }
     } else {
-        await ctx.editMessageText('Ваш профиль:\nВы еще не выбрали группу для отслеживания', createMenuWithBackButton([], ctx));
+        console.error(err)
+        logger.error(`Произошла неизвестная ошибка:`, err);
     }
 });
 
 
-import crypto from 'crypto';
-import {logger} from "./helpers/logger";
-
-
-// Периодическая проверка расписаний каждые 30 минут
-setInterval(async () => {
-    console.log("check updates")
-    await checkForUpdates();
-}, 30 * 1000 * 60); // 30 минут
-
-async function checkForUpdates() {
-    // Получаем все расписания из базы данных
-    const schedules = await prisma.schedule.findMany();
-
-    for (const schedule of schedules) {
-        // Получаем актуальные данные по расписанию
-        const fetchedSchedule = new Schedule();
-        const scheduleData = await fetchedSchedule.fetchSchedule(schedule.url);
-
-        if (scheduleData) {
-            // Генерируем хэш-сумму для текущего расписания
-            const currentChecksum = crypto
-                .createHash('md5')
-                .update(JSON.stringify(scheduleData))
-                .digest('hex');
-
-            // Сравниваем с предыдущей хэш-суммой
-            if (schedule.checksum !== currentChecksum) {
-                // Если хэш-сумма изменилась, обновляем базу данных
-                await prisma.schedule.update({
-                    where: {id: schedule.id},
-                    data: {
-                        checksum: currentChecksum,
-                        schedule: JSON.stringify(scheduleData),
-                    },
-                });
-
-                // Уведомляем пользователей об изменении
-                await notifyUsers(schedule.id);
-            }
-        }
-    }
-}
-
-// Функция уведомления пользователей
-async function notifyUsers(scheduleId: number) {
-    // Находим всех пользователей, подписанных на это расписание
-    const users = await prisma.user.findMany({
-        where: {
-            // @ts-ignore
-            scheduleId: scheduleId
-        },
-    });
-
-    for (const user of users) {
-        // Отправляем уведомление пользователю
-        await bot.telegram.sendMessage(user.idTg, `Расписание группы изменилось!`);
-    }
-}
-
-
-bot.launch();
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+bot.launch().then(() => logger.info("Бот выключен"));
