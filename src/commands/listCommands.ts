@@ -1,4 +1,4 @@
-export const COMMANDS = [
+export const COMMANDS: {command: string; description: string}[] = [
     {
         command: "start",
         description: "Перезапустить бота"
