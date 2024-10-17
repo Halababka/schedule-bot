@@ -1,5 +1,6 @@
 // groupsObject.js
 import {fetchRSSFeed} from "../src/helpers/fetchRSSFeed";
+import logger from "../src/utils/logger";
 
 interface Group {
     [groupName: string]: string; // Имя группы и ссылка
@@ -16,22 +17,36 @@ interface Groups {
 export class GroupsObject {
     groups: Groups
     lastUpdateTime: Date | null
+    private readonly url: string
 
-    constructor() {
+    constructor(url: string) {
         this.groups = {};
         this.lastUpdateTime = null
+        this.url = url
+
+        this.initializeGroupsObject(true).then(()=> {logger.info("Получены rss данные")})
+
+        setInterval(async () => {
+            await this.updateInit()
+        }, 1001 * 60 * 60 * 24)
     }
 
-    async initializeGroupsObject(url: string, force: boolean = false) {
-        if (!this.lastUpdateTime || Object.keys(this.groups).length === 0 || force) {
-            await this.fetchSchedule(url)
+    async initializeGroupsObject(force: boolean = false) {
+        if (force || !this.lastUpdateTime || Object.keys(this.groups).length === 0 || this.daysDifferent()) {
+
+            await this.fetchSchedule(this.url)
 
             console.log("bot fetch rss")
         } else {
             console.log("bot not fetch rss, use local groups")
-            if (this.daysDifferent()) {
-                await this.fetchSchedule(url)
-            }
+        }
+    }
+
+    private async updateInit() {
+        console.log("this.url", this.url)
+        if (this.daysDifferent()) {
+            console.log("СРАБОТАЛО ОБНОВЛЕНИЕ")
+            await this.initializeGroupsObject(true)
         }
     }
 
@@ -52,10 +67,13 @@ export class GroupsObject {
 
             if (feed) {
                 this.parseRSSItems(feed)
+            } else {
+                logger.error("Не получены данные по RSS ссылки")
             }
 
             this.lastUpdateTime = new Date()
-        } catch {
+        } catch (err) {
+            logger.error(`Произошла ошибка ${err}`)
         }
     }
 
@@ -86,6 +104,70 @@ export class GroupsObject {
         }
         return null; // Если не найден заголовок или раздел, возвращаем null
     }
+
+    getAllGroups(query: string): { name: string }[] {
+        const result: { name: string }[] = [];
+
+        for (const title in this.groups) {
+            for (const section in this.groups[title]) {
+                for (const group in this.groups[title][section]) {
+                    if (group.toLowerCase().startsWith(query.toLowerCase())) {
+                        result.push({
+                            name: group
+                        });
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    getAllGroupsAndLink() {
+        const result = []
+
+        for (const title in this.groups) {
+            for (const section in this.groups[title]) {
+                for (const group in this.groups[title][section]) {
+                    result.push({
+                        group: group,
+                        url: this.groups[title][section][group]
+                    });
+                }
+            }
+        }
+
+        return result;
+    }
+
+    getLinkGroup(groupKey: string) {
+        for (const title in this.groups) {
+            for (const section in this.groups[title]) {
+                for (const group in this.groups[title][section]) {
+                    if (group === groupKey) {
+                        return this.groups[title][section][group]
+                    }
+                }
+            }
+        }
+    }
+
+    extractGroupId(url: string): string {
+        const params = new URLSearchParams(url.split('?')[1]); // Извлекаем параметры после '?'
+        return params.get('group') || ''; // Возвращаем значение параметра 'group'
+    }
+
+    // getAllGroups(): string[] {
+    //     const allGroups: string[] = [];
+    //
+    //     for (const title of Object.keys(this.groups)) {
+    //         for (const section of Object.keys(this.groups[title])) {
+    //             allGroups.push(...Object.keys(this.groups[title][section]));
+    //         }
+    //     }
+    //
+    //     return allGroups;
+    // }
+
 
     generateKeyboard(path = []) {
         const currentLevel = this.getLevel(path);
@@ -128,12 +210,15 @@ export class GroupsObject {
         return keyboard;
     }
 
-    generateDaysKeyboard(days: string[]) {
-        const keyboard = days.map(day => ({text: day, callback_data: `day_${day}`}));
+    generateDaysKeyboard(days: string[], source: string) {
+        const keyboard = days.map(day => ({
+            text: day,
+            callback_data: `${source}_day_${day}`
+        }));
 
         // Добавляем кнопку для отображения всех дней
         keyboard.push(
-            {text: 'Все дни', callback_data: 'all_days'}
+            {text: 'Все дни', callback_data: `${source}_all_days`}
         );
 
         return keyboard;
